@@ -3,17 +3,27 @@
 
 /*
  * Framebuffer = ABL's continuous-splash surface (reserved-memory cont_splash_region,
- * 0x9c000000 on both sweet and sunfish). The geometry below is the board default;
+ * 0x9c000000 on sweet and sunfish, 0x9c400000 on flame). The geometry below is the board default;
  * panel_detect() replaces it with what the MDP source pipe is actually scanning out.
  */
+#ifdef BOARD_FLAME
+#define FB_DEF_BASE	0x9c400000UL	/* Pixel 4: cont_splash_region */
+#else
 #define FB_DEF_BASE	0x9c000000UL
+#endif
 #define FB_DEF_W	1080
-#ifdef BOARD_SUNFISH
+#if defined(BOARD_FLAME)
+#define FB_DEF_H	2280		/* Pixel 4, nt37280 cmd-mode panel */
+#elif defined(BOARD_SUNFISH)
 #define FB_DEF_H	2340		/* Pixel 4a, sofef01 cmd-mode panel */
 #else
 #define FB_DEF_H	2400		/* sweet, DSC video-mode panel */
 #endif
+#ifdef BOARD_FLAME
+#define FB_MAX_BYTES	0x2400000	/* size of cont_splash_region (Pixel 4) */
+#else
 #define FB_MAX_BYTES	0x1700000	/* size of cont_splash_region */
+#endif
 
 #define FB_BASE		fb_base
 #define FB_W		((int)fb_w)

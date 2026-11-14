@@ -2,7 +2,7 @@
 """Build the minimal Apple Device Tree that the SWEET xnu needs to boot.
 
 Only what the early boot path actually reads (see NOTES.md); every MMIO
-address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--sunfish] [--scale2[=WxH]]
+address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--sunfish | --flame] [--scale2[=WxH]]
 """
 import hashlib, os, struct, sys
 
@@ -35,6 +35,13 @@ FB_W, FB_H, FB_STRIDE = 1080, 2400, 1080 * 4
 # (live /memory: 0x80000000 + 3 GiB and 0x140000000 + 0xbcc00000, both ending at
 # 0x1fcc00000); only the panel differs: sofef01, 1080x2340.
 SUNFISH_FB_H = 2340
+# --flame (Pixel 4, SM8150): values from the phone's live FDT (2026-11-14).
+# cont_splash_region is 0x9c400000 + 0x2400000; the active panel is the nt37280
+# cmd-mode panel at 1080x2280. RAM 0xc0000000-0x200000000 is contiguous and no
+# fixed reserved-memory region lies above 0xb0000000, so the --highmem window
+# (0x100000000 + 0xfcc00000) is unchanged. GICD/GICR and UFS are at the same
+# addresses as on SM7150. Stride: check the shim's "FB stride=" line on the phone.
+FLAME_FB, FLAME_FB_SIZE, FLAME_FB_H = 0x9c400000, 0x2400000, 2280
 # --scale2[=WxH]: render @2x instead of @3x (fewer pixels for CoreAnimation's CPU
 # renderer); the kernel scales the canvas to the panel. Default 828x1792 = the
 # iPhone XR/11 screen (414x896 pt): a real @2x screen class. 750x1624 (the iPhone X
@@ -90,7 +97,7 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False, fb_h=FB_H, scale2=None):
+def build(seed=None, qemu=False, highmem=False, fb_h=FB_H, scale2=None, fb=(FB, FB_SIZE)):
     """scale2: None (@3x, 1125x2436) or a (w, h) canvas from SCALE2_CANVASES (@2x)."""
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
@@ -208,7 +215,7 @@ def build(seed=None, qemu=False, highmem=False, fb_h=FB_H, scale2=None):
 
     fbcon = node('sweet-fbcon', [
         ph(),
-        ('reg', u64(FB, FB_SIZE)),
+        ('reg', u64(*fb)),
         ('width', u32(FB_W)),
         ('height', u32(fb_h)),
         ('stride', u32(FB_STRIDE)),
@@ -263,7 +270,9 @@ def build(seed=None, qemu=False, highmem=False, fb_h=FB_H, scale2=None):
 
 if __name__ == '__main__':
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv,
-                 fb_h=SUNFISH_FB_H if '--sunfish' in sys.argv else FB_H,
+                 fb_h=(FLAME_FB_H if '--flame' in sys.argv
+                       else SUNFISH_FB_H if '--sunfish' in sys.argv else FB_H),
+                 fb=(FLAME_FB, FLAME_FB_SIZE) if '--flame' in sys.argv else (FB, FB_SIZE),
                  scale2=next((tuple(int(v) for v in a.split('=', 1)[1].split('x')) if '=' in a
                               else SCALE2_DEFAULT for a in sys.argv if a.startswith('--scale2')), None))
     blob = adt.serialize(root)

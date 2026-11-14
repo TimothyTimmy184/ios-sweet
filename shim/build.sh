@@ -1,6 +1,8 @@
 #!/bin/bash
 # Build the shim and wrap it in a boot.img v2 that mirrors the stock boot header.
-# BOARD=sweet (Redmi Note 10 Pro, default) or BOARD=sunfish (Pixel 4a).
+# BOARD=sweet (Redmi Note 10 Pro, default), BOARD=sunfish (Pixel 4a) or BOARD=flame (Pixel 4).
+# flame: OSVER/OSPATCH/AVB_PATCH default to this phone's Lineage boot header (Android 16, 2026-03);
+# override them after a Lineage update (getprop ro.build.version.release / .security_patch).
 set -euo pipefail
 cd "$(dirname "$0")"
 BOARD=${BOARD:-sweet}
@@ -10,6 +12,7 @@ CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align
 case $BOARD in
 sweet)	DTB=../dtb/boot_unpacked/dtb; OSVER=17.0.0; OSPATCH=2035-06 ;;
 sunfish) CFLAGS="$CFLAGS -DBOARD_SUNFISH"; DTB=../dtb/sunfish/dtb; OSVER=13.0.0; OSPATCH=2023-08 ;;
+flame)	CFLAGS="$CFLAGS -DBOARD_FLAME"; DTB=../dtb/flame/dtb; OSVER=${OSVER:-16.0.0}; OSPATCH=${OSPATCH:-2026-03}; AVB_PATCH=${AVB_PATCH:-2026-03-01} ;;	# LineageOS 23.2 (2026-03-26) boot_b header: os_version 0x200001a3
 *)	echo "unknown BOARD=$BOARD" >&2; exit 1 ;;
 esac
 mkdir -p out
@@ -26,7 +29,7 @@ $CC $CFLAGS -static -T shim.ld -Wl,--build-id=none -Wl,--no-warn-rwx-segments -W
 	$OBJS -o out/shim.elf
 $OBJCOPY -O binary out/shim.elf out/Image
 # ABL copies the file; pad to image_size so .bss/stacks exist as zeroed bytes.
-size=$(aarch64-linux-gnu-nm out/shim.elf | awk '$3=="_end"{print strtonum("0x"$1)}')
+size=$(( 0x$(aarch64-linux-gnu-nm out/shim.elf | awk '$3=="_end"{print $1}') ))	# no gawk strtonum: works with mawk
 truncate -s "$size" out/Image
 # Ramdisk: an xnu payload (tools/mkpayload.py) if given as $1, else an empty
 # newc cpio (ABL dislikes a zero-size ramdisk on some builds) -> diagnostics.
@@ -36,7 +39,7 @@ else
 	(cd out && rm -rf rd && mkdir rd && cd rd && find . | cpio -o -H newc --quiet | gzip -9 > ../ramdisk.bin)
 fi
 KERNEL=out/Image
-if [ "$BOARD" = sunfish ]; then
+if [ "$BOARD" = sunfish ] || [ "$BOARD" = flame ]; then
 	# Google ABL rejects a raw Image ("Unsupported"): ship it as an LZ4 frame like stock.
 	lz4 -f -q -9 out/Image out/Image.lz4
 	KERNEL=out/Image.lz4
@@ -46,11 +49,11 @@ mkbootimg --header_version 2 --kernel $KERNEL --ramdisk out/ramdisk.bin \
 	--tags_offset 0x100 --dtb_offset 0x1f00000 --pagesize 4096 \
 	--os_version $OSVER --os_patch_level $OSPATCH \
 	--cmdline "console=null" -o out/shim-boot.img
-if [ "$BOARD" = sunfish ]; then
+if [ "$BOARD" = sunfish ] || [ "$BOARD" = flame ]; then
 	# Stock shape: 64 MiB boot partition with an unsigned AVB hash footer (AOSP external/avb).
 	python3 -I "${AVBTOOL:-$HOME/ios-pixel/src/avb/avbtool.py}" add_hash_footer --image out/shim-boot.img \
 		--partition_name boot --partition_size 67108864 --algorithm NONE \
-		--prop com.android.build.boot.os_version:13 --prop com.android.build.boot.security_patch:2023-08-05
+		--prop com.android.build.boot.os_version:${OSVER%%.*} --prop com.android.build.boot.security_patch:${AVB_PATCH:-$OSPATCH-05}
 fi
 # Host render of the console layout.
 gcc -O1 -Wall $(echo "$CFLAGS" | grep -o -- '-DBOARD_[A-Z]*' || true) -o out/host_test console.c host_test.c && ./out/host_test

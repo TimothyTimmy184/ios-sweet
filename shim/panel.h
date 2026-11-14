@@ -3,6 +3,7 @@
 
 struct panel_info {
 	int sspp;		/* source pipe scanning the splash, -1 if none found */
+	int sspp2;		/* source-split partner (right half of the same surface), -1 if none */
 	uint32_t src_addr, src_size, ystride, format;
 	uint32_t pp_te;		/* bit n: ping-pong n has tear check on (cmd-mode path) */
 	uint32_t pp_ar_before;	/* bit n: ABL had already enabled autorefresh on PP n */
@@ -22,3 +23,6 @@ void panel_detect(struct panel_info *pi);
  * No-op on video-mode panels (no PP has tear check on).
  */
 void panel_keep_refreshing(struct panel_info *pi);
+
+/* Print every source pipe with a nonzero address or size (board bring-up). */
+void panel_dump(void);

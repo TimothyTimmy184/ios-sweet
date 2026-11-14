@@ -7,7 +7,7 @@
 _head:
 	b	_start			/* code0 */
 	.long	0			/* code1 */
-#ifdef BOARD_SUNFISH
+#if defined(BOARD_SUNFISH) || defined(BOARD_FLAME)
 	.quad	0x80000			/* text_offset: Google ABL rejects 0 ("Invalid Parameter") */
 #else
 	.quad	0			/* text_offset */

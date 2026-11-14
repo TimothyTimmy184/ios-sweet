@@ -385,12 +385,18 @@ void shim_main(uint64_t dtb)
 	/* An xnu payload in the ramdisk means: boot it (MMU stays off). */
 	stage = "loader";
 	con_clear(RED);
-#ifdef BOARD_SUNFISH
+#if defined(BOARD_FLAME)
+	con_str("SHIM", "flame milestone A: xnu loader");
+#elif defined(BOARD_SUNFISH)
 	con_str("SHIM", "sunfish milestone A: xnu loader");
 #else
 	con_str("SHIM", "sweet milestone 4: xnu loader");
 #endif
 	con_hex2("SSPP", "pipe=", pi.sspp, "addr=", pi.src_addr);
+	con_hex2("SSPP2", "pipe=", pi.sspp2, "w=", fb_w);
+#ifdef BOARD_FLAME
+	panel_dump();
+#endif
 	con_hex2("SRC", "size=", pi.src_size, "pitch=", pi.ystride);
 	con_hex2("FB", "w=", fb_w, "h=", fb_h);
 	con_hex2("FB", "stride=", fb_stride, "fmt=", pi.format);
@@ -431,7 +437,9 @@ void shim_main(uint64_t dtb)
 	if (rc)
 		con_clear(RED);
 
-#ifdef BOARD_SUNFISH
+#if defined(BOARD_FLAME)
+	con_str("SHIM", "flame milestone A: probe");
+#elif defined(BOARD_SUNFISH)
 	con_str("SHIM", "sunfish milestone A: probe");
 #else
 	con_str("SHIM", "sweet milestone 3");
