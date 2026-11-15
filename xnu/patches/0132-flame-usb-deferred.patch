@@ -1,0 +1,178 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -40,6 +40,23 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ void sweet_usb_probe(void);
+ static void sweet_usb_gadget_start(vm_offset_t dwc);
++static void usb_defer_thread(void *arg, wait_result_t wr);
++/* Mach MIG declaration is not included by BSD's exported thread.h (as in sweet_touch.c). */
++extern kern_return_t thread_terminate(thread_t);
++/*
++ * flame (sweetusbboard=2): U1 reset the phone before the first log flush, with the device
++ * start running synchronously at the end of UFS bring-up. So on flame the start runs from a
++ * thread sweetusbdelay seconds later (default 30), logs each step and sleeps sweetusbstepms
++ * (default 2000) before it so the persistent log (ufslogsecs=1) keeps the last step; first it
++ * reads, without writing, how the apps SMMU treats the controller's stream (DT ssusb iommus
++ * SID 0x140) and stops unless that stream bypasses translation (sweetusbforce=1 overrides).
++ * Its DMA memory stays below 4 GiB, where ABL keeps its own event buffer.
++ */
++static int usb_flame, usb_force;
++static unsigned usb_delay_s = 30, usb_step_ms = 2000;
++static vm_offset_t usb_dwc_deferred;
++#define APPS_SMMU_PA            0x15000000u
++#define USB_SMMU_SID            0x140u
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ 
+ #define GCC_PA                  0x00100000
+@@ -94,6 +111,10 @@
+ 	int board = 0;
+ 	PE_parse_boot_argn("sweetusbboard", &board, sizeof(board));
+ 	if (board == 2) {
++		usb_flame = 1;
++		PE_parse_boot_argn("sweetusbdelay", &usb_delay_s, sizeof(usb_delay_s));
++		PE_parse_boot_argn("sweetusbstepms", &usb_step_ms, sizeof(usb_step_ms));
++		PE_parse_boot_argn("sweetusbforce", &usb_force, sizeof(usb_force));
+ 		usb_cbcr[3].off = 0x0f078;
+ 		usb_cbcr[4].off = 0x0f07c;
+ 		usb_cbcr[5].off = 0;    /* no QUSB2 PHY to read on flame */
+@@ -136,7 +157,14 @@
+ 	printf("SWEET USB: DWC3 GEVNTADR 0x%08x%08x GEVNTSIZ 0x%08x GEVNTCOUNT 0x%08x GHWPARAMS0 0x%08x\n",
+ 	    usb_rd(dwc, 0xc404), usb_rd(dwc, 0xc400), usb_rd(dwc, 0xc408), usb_rd(dwc, 0xc40c),
+ 	    usb_rd(dwc, 0xc140));
+-	if (enabled >= 2) {
++	if (enabled >= 2 && usb_flame) {
++		thread_t t;
++		usb_dwc_deferred = dwc;
++		if (kernel_thread_start(usb_defer_thread, NULL, &t) == KERN_SUCCESS) {
++			thread_deallocate(t);
++			printf("SWEET USB: device start deferred %u s (flame), %u ms per step\n", usb_delay_s, usb_step_ms);
++		}
++	} else if (enabled >= 2) {
+ 		sweet_usb_gadget_start(dwc);
+ 	}
+ 	if (usb_cbcr[5].off == 0) {
+@@ -866,18 +894,86 @@
+ 			size_t sent = 0;
+ 			if (sock_send(so, &msg, 0, &sent) != 0) {
+ 				break;          /* no route/ARP yet: retry later */
++			}
++		}
++	}
++}
++
++static void
++usb_step(const char *what)
++{
++	if (!usb_flame) {
++		return;
++	}
++	printf("SWEET USB: next: %s (in %u ms)\n", what, usb_step_ms);
++	ud_sleep_ms(usb_step_ms);
++}
++
++/* True if the apps SMMU lets stream 0x140 through untranslated. Reads only. */
++static bool
++usb_apps_smmu_ok(void)
++{
++	vm_offset_t s = ml_io_map(APPS_SMMU_PA, 0x1000);
++	if (s == 0) {
++		printf("SWEET USB: apps SMMU map failed\n");
++		return false;
++	}
++	uint32_t scr0 = usb_rd(s, 0x000), idr0 = usb_rd(s, 0x020), nsmr = idr0 & 0xffu;
++	printf("SWEET USB: apps SMMU sCR0 0x%08x IDR0 0x%08x (%u stream-match groups)\n", scr0, idr0, nsmr);
++	if (scr0 & 1u) {
++		printf("SWEET USB: apps SMMU client port disabled: every stream bypasses\n");
++		return true;
++	}
++	int hit = -1;
++	for (uint32_t i = 0; i < nsmr && i < 256; i++) {
++		uint32_t smr = usb_rd(s, 0x800 + 4 * i);
++		uint32_t id = smr & 0x7fffu, mask = (smr >> 16) & 0x7fffu;
++		if ((smr & (1u << 31)) && ((USB_SMMU_SID ^ id) & ~mask) == 0) {
++			uint32_t s2cr = usb_rd(s, 0xc00 + 4 * i);
++			printf("SWEET USB: stream 0x%x matches SMR%u 0x%08x: S2CR 0x%08x (type %u, bank %u)\n",
++			    USB_SMMU_SID, i, smr, s2cr, (s2cr >> 16) & 3u, s2cr & 0xffu);
++			if (hit < 0) {
++				hit = (int)((s2cr >> 16) & 3u);
+ 			}
+ 		}
+ 	}
++	if (hit < 0) {
++		bool fault = (scr0 & (1u << 10)) != 0;
++		printf("SWEET USB: stream 0x%x matches no SMR; unmatched streams %s\n", USB_SMMU_SID,
++		    fault ? "FAULT" : "bypass");
++		return !fault;
++	}
++	if (hit == 1) {
++		return true;
++	}
++	printf("SWEET USB: stream 0x%x is %s by the apps SMMU\n", USB_SMMU_SID, hit == 0 ? "TRANSLATED" : "FAULTED");
++	return false;
+ }
+ 
+ static void
++usb_defer_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	printf("SWEET USB: device start in %u s\n", usb_delay_s);
++	ud_sleep_ms(usb_delay_s * 1000u);
++	usb_step("apps SMMU check for the USB stream (reads only)");
++	bool ok = usb_apps_smmu_ok();
++	if (!ok && !usb_force) {
++		printf("SWEET USB: device start stopped: USB DMA would not bypass the apps SMMU (sweetusbforce=1 overrides)\n");
++	} else {
++		sweet_usb_gadget_start(usb_dwc_deferred);
++	}
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
+ sweet_usb_gadget_start(vm_offset_t dwc)
+ {
+ 	thread_t thread;
+ 
+ 	ud.dwc = dwc;
+-	if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK, 0, 0,
++	ppnum_t max_pn = usb_flame ? (ppnum_t)(atop_64(0x100000000ULL) - 1) : 0;
++	if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK, max_pn, 0,
+ 	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 		printf("SWEET USB: no DMA memory\n");
+ 		return;
+@@ -887,9 +983,12 @@
+ 		return;
+ 	}
+ 	ud.dma_pa = ptoa_64(pn);
++	printf("SWEET USB: DMA at 0x%llx\n", ud.dma_pa);
++	usb_step("network interface (ue0) create");
+ 	ud_if_create();
+ 
+ 	/* Device controller soft reset (PHY and global setup stay as ABL left them). */
++	usb_step("DWC3 device soft reset (DCTL.CSFTRST)");
+ 	dwc_wr(DCTL, DCTL_CSFTRST);
+ 	int i;
+ 	for (i = 0; i < 500 && (dwc_rd(DCTL) & DCTL_CSFTRST); i++) {
+@@ -901,6 +1000,7 @@
+ 		return;
+ 	}
+ 
++	usb_step("event buffer, high speed, endpoint 0");
+ 	dwc_wr(GEVNTADRLO, (uint32_t)(ud.dma_pa + UD_EVT));
+ 	dwc_wr(GEVNTADRHI, (uint32_t)((ud.dma_pa + UD_EVT) >> 32));
+ 	dwc_wr(GEVNTSIZ, (1u << 31) | UD_EVT_SIZE);     /* interrupt masked: polled */
+@@ -925,6 +1025,7 @@
+ 	dwc_wr(DALEPENA, 0x3);
+ 	ud_start_setup();
+ 
++	usb_step("QSCRATCH VBUS override");
+ 	vm_offset_t qs = ml_io_map(QSCRATCH_PA, 0x100);
+ 	if (qs != 0) {
+ 		uint32_t hs = usb_rd(qs, QSCRATCH_HS_PHY_CTRL), ss = usb_rd(qs, QSCRATCH_SS_PHY_CTRL);
+@@ -937,6 +1038,7 @@
+ 		    usb_rd(qs, QSCRATCH_HS_PHY_CTRL), usb_rd(qs, QSCRATCH_SS_PHY_CTRL));
+ 	}
+ 
++	usb_step("DCTL run (pull-up on: the host sees the device)");
+ 	dwc_wr(DCTL, dwc_rd(DCTL) | DCTL_RUN_STOP);
+ 	for (i = 0; i < 500 && (dwc_rd(DSTS) & DSTS_DEVCTRLHLT); i++) {
+ 		delay(1000);
