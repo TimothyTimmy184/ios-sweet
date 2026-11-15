@@ -1,0 +1,181 @@
+--- a/bsd/dev/sweet_gpu_internal.h
++++ b/bsd/dev/sweet_gpu_internal.h
+@@ -11,9 +11,22 @@
+ #include <sys/systm.h>
+ #include <kern/clock.h>
+ 
+-/* GMU (sdmmagpie-gpu.dtsi); sweet_gpu_regs.h offsets are dwords from GPU_PA */
+-#define GPU_PA                  0x05000000u
+-#define GMU_PA                  0x0506a000u
++/*
++ * Per-board bases. Defaults: SM7150 (sweet, sunfish; sdmmagpie-gpu.dtsi).
++ * sweetgpuboard=2 selects flame (SM8150, Adreno 640, Pixel 4 DT): GPU
++ * 0x2c00000, GMU 0x2c6a000 (the same +0x6a000 layout, so GMU_SIZE and the
++ * RSCC/GMU_AO offsets carry over), gpucc 0x2c90000 (gpucc-sm8150.c: same
++ * register offsets as SM7150). Set once in sweet_gpu_init before any thread.
++ * sweet_gpu_regs.h offsets are dwords from GPU_PA.
++ */
++struct sweet_gpu_board {
++	uint32_t gpu_pa, gmu_pa, gpucc_pa, cx_misc_pa, ddrss_axi_cbcr;
++	uint32_t speed_bin_off, speed_bin_mask, speed_bin_shift;
++	int flame;
++};
++extern struct sweet_gpu_board sweet_gpu_board;
++#define GPU_PA                  (sweet_gpu_board.gpu_pa)
++#define GMU_PA                  (sweet_gpu_board.gmu_pa)
+ #define GMU_SIZE                0x31000u        /* covers RSCC (0x508d000) and GMU_AO (0x508ec00) */
+ 
+ /* sweet_gpu.c: log what comes next, then let the persistent log reach the disk. */
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -127,14 +127,14 @@
+ #define GPU_GMU_MEM_SIZE        0x100000u
+ #define GPU_BIN_2B              146u            /* the perf table sweet_gmu.c sends */
+ #define QFPROM_PA               0x780000u
+-#define QFPROM_GPU_SPEED_BIN    0x41a0u
+-#define GPU_SPEED_BIN_MASK      0x1fe00000u
+-#define GPU_SPEED_BIN_SHIFT     21
++#define QFPROM_GPU_SPEED_BIN    (sweet_gpu_board.speed_bin_off)
++#define GPU_SPEED_BIN_MASK      (sweet_gpu_board.speed_bin_mask)
++#define GPU_SPEED_BIN_SHIFT     (sweet_gpu_board.speed_bin_shift)
+ 
+ /* Stage 1. GCC (gcc-sdmmagpie.c) */
+ #define GCC_PA                  0x00100000u
+ #define GCC_SIZE                0x00080000u
+-#define GCC_DDRSS_GPU_AXI_CBCR  0x4452cu
++#define GCC_DDRSS_GPU_AXI_CBCR  (sweet_gpu_board.ddrss_axi_cbcr)
+ #define GCC_APCS_CLOCK_VOTE     0x52004u
+ #define GCC_VOTE_GPU_GPLL0      (1u << 15)
+ #define GCC_VOTE_GPU_GPLL0_DIV  (1u << 16)
+@@ -143,7 +143,7 @@
+ #define GCC_GPU_SNOC_DVM_CBCR   0x71018u
+ #define GCC_GPU_MISC            0x71028u
+ /* gpucc (gpucc-sdmmagpie.c, sdmmagpie-gdsc.dtsi) */
+-#define GPUCC_PA                0x05090000u
++#define GPUCC_PA                (sweet_gpu_board.gpucc_pa)
+ #define GPUCC_SIZE              0x9000u
+ #define GPUCC_PLL0              0x0000u         /* Fabia: +0 MODE, +4 L */
+ #define GPUCC_PLL1              0x0100u
+@@ -158,7 +158,7 @@
+ #define GPUCC_GX_DOMAIN         0x1508u         /* bit 0: GX clamp_io */
+ #define GPUCC_CX_GDS_HW_CTRL    0x1540u         /* hw-ctrl-addr: CX GDSC status */
+ /* cx_misc (sdmmagpie-gpu.dtsi); GPU_PA and GMU_PA are in sweet_gpu_internal.h */
+-#define CX_MISC_PA              0x0509e000u
++#define CX_MISC_PA              (sweet_gpu_board.cx_misc_pa)
+ #define CX_MISC_SIZE            0x1000u
+ 
+ #define CBCR_CLK_OFF            (1u << 31)
+@@ -242,6 +242,19 @@
+ #define MEAS_TICKS_FULL         0x10000u        /* about 14 ms */
+ #define MEAS_XO_DIV4_HZ         4800000u
+ #define MEAS_FAILED             0xffffffffu
++
++/*
++ * SM7150 defaults. flame (SM8150, Pixel 4 DT and Linux gcc/gpucc-sm8150.c):
++ * gcc_ddrss_gpu_axi 0x71154; qcom,gpu-speed-bin = <0x4130 0xe0000000 29>;
++ * cx_misc by the gpucc + 0xe000 pattern of SM7150 and SM8250 (it is not in
++ * the flame kgsl node). The GCC GPU branches, GPLL0 votes, gpucc offsets and
++ * the GMU RCG parent (GPLL0 div = 6) match SM7150.
++ */
++struct sweet_gpu_board sweet_gpu_board = {
++	.gpu_pa = 0x05000000u, .gmu_pa = 0x0506a000u, .gpucc_pa = 0x05090000u,
++	.cx_misc_pa = 0x0509e000u, .ddrss_axi_cbcr = 0x4452cu,
++	.speed_bin_off = 0x41a0u, .speed_bin_mask = 0x1fe00000u, .speed_bin_shift = 21,
++};
+ 
+ enum { BLOB_SQE, BLOB_GMU, BLOB_ZAP_MDT, BLOB_ZAP_B02, BLOB_GMU_MEM, BLOB_COUNT };
+ 
+@@ -415,7 +428,7 @@
+ static int
+ gpu_speed_bin(void)
+ {
+-	gpu_pause("QFPROM speed-bin read at 0x7841a0");
++	gpu_pause("QFPROM speed-bin read");
+ 	vm_offset_t q = ml_io_map(QFPROM_PA + QFPROM_GPU_SPEED_BIN, 4);
+ 	if (!q) {
+ 		printf("SWEET GPU: QFPROM mapping failed\n");
+@@ -423,6 +436,11 @@
+ 	}
+ 	uint32_t raw = gpu_rd(q, 0);
+ 	unsigned bin = (raw & GPU_SPEED_BIN_MASK) >> GPU_SPEED_BIN_SHIFT;
++	if (sweet_gpu_board.flame) {
++		printf("SWEET GPU: speed bin (flame, %#x) raw=%#x bin=%u\n",
++		    QFPROM_PA + QFPROM_GPU_SPEED_BIN, raw, bin);
++		return (int)bin;
++	}
+ 	printf("SWEET GPU: speed bin raw=%#x bin=%u -> %s fmax %u MHz\n", raw, bin,
+ 	    bin ? "table" : "default table,", bin ? bin * 48u / 10u : 825u);
+ 	return (int)bin;
+@@ -451,8 +469,9 @@
+ 	bool halt;      /* BRANCH_HALT / BRANCH_VOTED: CLK_OFF must clear. Else BRANCH_HALT_DELAY. */
+ };
+ 
+-static const struct gpu_branch gpu_gcc_branches[] = {
+-	{ "gcc_ddrss_gpu_axi", GCC_DDRSS_GPU_AXI_CBCR, true },
++/* Not const: entry 0 takes the board's ddrss_gpu_axi offset in sweet_gpu_init. */
++static struct gpu_branch gpu_gcc_branches[] = {
++	{ "gcc_ddrss_gpu_axi", 0x4452cu, true },
+ 	{ "gcc_gpu_memnoc_gfx", GCC_GPU_MEMNOC_GFX_CBCR, true },
+ 	{ "gcc_gpu_snoc_dvm_gfx", GCC_GPU_SNOC_DVM_CBCR, true },
+ };
+@@ -635,7 +654,7 @@
+ 		}
+ 		gpu_log_clocks(gcc, cc, "with gpu_cfg_ahb");
+ 	}
+-	gpu_pause("CX GDSC on (gpucc 0x509106c)");
++	gpu_pause("CX GDSC on (gpucc +0x106c)");
+ 	if (!gpu_cx_gdsc_on(cc)) {
+ 		printf("SWEET GPU: stage 1 stopped: CX GDSC\n");
+ 		return false;
+@@ -646,7 +665,7 @@
+ 		printf("SWEET GPU: stage 1 stopped: GCC branches\n");
+ 		return false;
+ 	}
+-	gpu_pause("GMU RCG to 200 MHz (gpucc 0x5091120)");
++	gpu_pause("GMU RCG to 200 MHz (gpucc +0x1120)");
+ 	if (!gpu_gmu_rcg_200mhz(cc)) {
+ 		printf("SWEET GPU: stage 1 stopped: GMU RCG\n");
+ 		return false;
+@@ -658,13 +677,13 @@
+ 		printf("SWEET GPU: stage 1 stopped: gpucc branches\n");
+ 		return false;
+ 	}
+-	gpu_pause("GMU register reads (CX side of 0x506a000)");
++	gpu_pause("GMU register reads (CX side of the GMU block)");
+ 	gpu_gmu_reads(gmu, cc);
+-	gpu_pause("GMU ITCM read (0x506d000)");
++	gpu_pause("GMU ITCM read (GMU +0x3000)");
+ 	printf("SWEET GPU:   ITCM %08x %08x %08x %08x\n", gmu_rd(gmu, REG_A6XX_GMU_CM3_ITCM_START),
+ 	    gmu_rd(gmu, REG_A6XX_GMU_CM3_ITCM_START + 1u), gmu_rd(gmu, REG_A6XX_GMU_CM3_ITCM_START + 2u),
+ 	    gmu_rd(gmu, REG_A6XX_GMU_CM3_ITCM_START + 3u));
+-	gpu_pause("cx_misc read (0x509e000)");
++	gpu_pause("cx_misc read (gpucc +0xe000)");
+ 	printf("SWEET GPU:   cx_misc SYSTEM_CACHE_CNTL_0 0x%08x _1 0x%08x\n",
+ 	    gpu_rd(cxm, REG_A6XX_SYSTEM_CACHE_CNTL_0 * 4u), gpu_rd(cxm, REG_A6XX_SYSTEM_CACHE_CNTL_1 * 4u));
+ 	printf("SWEET GPU: stage 1 done; CX clocks and GDSC stay on\n");
+@@ -1275,6 +1294,25 @@
+ 	if (gpu_level <= 0) {
+ 		return;
+ 	}
++	int board = 0;
++	(void)PE_parse_boot_argn("sweetgpuboard", &board, sizeof(board));
++	if (board == 2) {
++		sweet_gpu_board = (struct sweet_gpu_board){
++			.gpu_pa = 0x02c00000u, .gmu_pa = 0x02c6a000u, .gpucc_pa = 0x02c90000u,
++			.cx_misc_pa = 0x02c9e000u, .ddrss_axi_cbcr = 0x71154u,
++			.speed_bin_off = 0x4130u, .speed_bin_mask = 0xe0000000u, .speed_bin_shift = 29,
++			.flame = 1,
++		};
++		gpu_gcc_branches[0].cbcr = sweet_gpu_board.ddrss_axi_cbcr;
++		/* Stage 2+ (rails, GMU firmware, SMMU, CP, zap) still carry A618 values. */
++		if (gpu_level > 2) {
++			printf("SWEET GPU: flame (Adreno 640): only stages 0-1 are ported; sweetgpu=%d -> 2\n",
++			    gpu_level);
++			gpu_level = 2;
++		}
++		printf("SWEET GPU: board flame: gpu %#x gmu %#x gpucc %#x cx_misc %#x\n",
++		    GPU_PA, GMU_PA, GPUCC_PA, CX_MISC_PA);
++	}
+ 	(void)PE_parse_boot_argn("sweetgpuhang", &gpu_hang, sizeof(gpu_hang));
+ 	(void)PE_parse_boot_argn("sweetgpudelay", &gpu_delay_s, sizeof(gpu_delay_s));
+ 	if (gpu_delay_s > 600) {
