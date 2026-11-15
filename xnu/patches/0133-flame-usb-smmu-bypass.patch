@@ -1,0 +1,77 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -52,7 +52,7 @@
+  * SID 0x140) and stops unless that stream bypasses translation (sweetusbforce=1 overrides).
+  * Its DMA memory stays below 4 GiB, where ABL keeps its own event buffer.
+  */
+-static int usb_flame, usb_force;
++static int usb_flame, usb_force, usb_bypass = 1;      /* sweetusbbypass=0: only report */
+ static unsigned usb_delay_s = 30, usb_step_ms = 2000;
+ static vm_offset_t usb_dwc_deferred;
+ #define APPS_SMMU_PA            0x15000000u
+@@ -115,6 +115,7 @@
+ 		PE_parse_boot_argn("sweetusbdelay", &usb_delay_s, sizeof(usb_delay_s));
+ 		PE_parse_boot_argn("sweetusbstepms", &usb_step_ms, sizeof(usb_step_ms));
+ 		PE_parse_boot_argn("sweetusbforce", &usb_force, sizeof(usb_force));
++		PE_parse_boot_argn("sweetusbbypass", &usb_bypass, sizeof(usb_bypass));
+ 		usb_cbcr[3].off = 0x0f078;
+ 		usb_cbcr[4].off = 0x0f07c;
+ 		usb_cbcr[5].off = 0;    /* no QUSB2 PHY to read on flame */
+@@ -941,7 +942,42 @@
+ 		bool fault = (scr0 & (1u << 10)) != 0;
+ 		printf("SWEET USB: stream 0x%x matches no SMR; unmatched streams %s\n", USB_SMMU_SID,
+ 		    fault ? "FAULT" : "bypass");
+-		return !fault;
++		if (!fault) {
++			return true;
++		}
++		if (!usb_bypass) {
++			return false;
++		}
++		/*
++		 * flame U2: unmatched streams fault and nothing matches 0x140, so the controller's
++		 * first DMA faulted the apps SMMU and reset the phone (U1). As Linux arm-smmu does for
++		 * a bypass domain: a free stream-match group, S2CR first (type bypass), then the SMR
++		 * (valid, id 0x140, mask 0). Only that group is written; both are read back.
++		 */
++		for (uint32_t i = 0; i < nsmr && i < 256; i++) {
++			uint32_t smr = usb_rd(s, 0x800 + 4 * i);
++			if (smr & (1u << 31)) {
++				continue;
++			}
++			uint32_t s2cr_old = usb_rd(s, 0xc00 + 4 * i);
++			*(volatile uint32_t *)(s + 0xc00 + 4 * i) = 1u << 16;          /* S2CR: bypass */
++			__asm__ volatile ("dsb sy" ::: "memory");
++			*(volatile uint32_t *)(s + 0x800 + 4 * i) = (1u << 31) | USB_SMMU_SID;
++			__asm__ volatile ("dsb sy" ::: "memory");
++			uint32_t s2cr = usb_rd(s, 0xc00 + 4 * i), smr_new = usb_rd(s, 0x800 + 4 * i);
++			bool took = ((s2cr >> 16) & 3u) == 1u && smr_new == ((1u << 31) | USB_SMMU_SID);
++			printf("SWEET USB: SMR%u 0x%08x -> 0x%08x, S2CR 0x%08x -> 0x%08x: %s; sGFSR 0x%08x\n", i, smr,
++			    smr_new, s2cr_old, s2cr, took ? "stream 0x140 bypasses" : "DID NOT TAKE",
++			    usb_rd(s, 0x048));
++			if (!took) {
++				*(volatile uint32_t *)(s + 0x800 + 4 * i) = smr;
++				*(volatile uint32_t *)(s + 0xc00 + 4 * i) = s2cr_old;
++				__asm__ volatile ("dsb sy" ::: "memory");
++			}
++			return took;
++		}
++		printf("SWEET USB: no free stream-match group\n");
++		return false;
+ 	}
+ 	if (hit == 1) {
+ 		return true;
+@@ -1044,6 +1080,13 @@
+ 		delay(1000);
+ 	}
+ 	printf("SWEET USB: running (DSTS 0x%08x after %d ms), DMA at 0x%llx\n", dwc_rd(DSTS), i, ud.dma_pa);
++	if (usb_flame) {
++		vm_offset_t sm = ml_io_map(APPS_SMMU_PA, 0x1000);
++		if (sm != 0) {
++			printf("SWEET USB: apps SMMU after run: sGFSR 0x%08x sGFSYNR0 0x%08x\n", usb_rd(sm, 0x048),
++			    usb_rd(sm, 0x050));
++		}
++	}
+ 	if (kernel_thread_start(ud_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
