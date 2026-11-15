@@ -1,0 +1,268 @@
+--- a/bsd/dev/sweet_gmu.c
++++ b/bsd/dev/sweet_gmu.c
+@@ -33,6 +33,12 @@
+  * PDC TCS3 cx.lvl wake vote is 3; chip id 6.4.0.1 goes to the GMU as
+  * 0x06040100. The GMU streams are SID 4 and 5 with SMR mask 0x400 in the
+  * Pixel 4 DT, so flame matches 4, 5, 0x404 and 0x405 exactly (mask 0).
++ * flame 2B.4-2B.6 (HFI v2, mainline non-legacy order): 2B.4 only computes the
++ * perf votes (no gfx_rail_on, no SPTPRAC: the firmware owns both); 2B.5 is
++ * HFI start, PERF_TABLE (v2: vote, acd, freq), BW_TABLE (a640_build_bw_table),
++ * CORE_FW_START and START, with queue writes padded to 4 dwords (0xfafafafa)
++ * and reads realigned to 4; 2B.6 is GX_BW_PERF_VOTE to the lowest level, then
++ * OOB GPU_SET (request bit 30, ack bit 31), which is when the GMU powers GX.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -202,7 +208,18 @@
+ static const uint32_t gmu_level_khz[GMU_LEVELS] = { 0, 200000 };
+ static const unsigned gmu_level_vlvl[GMU_LEVELS] = { 0, 48 };   /* 200 MHz needs MIN_SVS */
+ static const uint32_t gmu_level_vote_want[GMU_LEVELS] = { 0, 0x00400202u };
+-#define GPU_LEVEL_START         1u              /* 180 MHz, kgsl's initial level 6 */
++#define GPU_LEVEL_START         1u              /* 180 MHz, kgsl's initial level 6 (flame: 257 MHz) */
++/* flame speed bin 0 (Pixel 4 DT qcom,gpu-pwrlevels-0, gpu_opp_table_v2), perf-index order; the DT
++ * corners are the RPMh level + 1 (0x41 = LOW_SVS 64 + 1), as kgsl stores them. */
++#define FL_GPU_LEVELS           6u
++static const uint32_t fl_level_khz[FL_GPU_LEVELS] = { 0, 257000, 345000, 427000, 499200, 585000 };
++static const unsigned fl_level_vlvl[FL_GPU_LEVELS] = { 0, 64, 128, 192, 224, 256 };
++#define OOB_GPU_SET_NEW         30u             /* a6xx_gmu_oob_bits: set_new 30, ack_new 31 */
++#define OOB_GPU_ACK_NEW         31u
++#define H2F_MSG_START           10u
++#define H2F_MSG_CORE_FW_START   14u
++#define H2F_MSG_GX_BW_PERF_VOTE 30u
++#define HFI_PERF_V2_DWORDS      (3u + 3u * HFI_MAX_GX_LEVELS + 2u * HFI_MAX_CX_LEVELS)
+ 
+ static vm_offset_t gm_gmu, gm_mem, gm_pdc_cfg, gm_pdc_seq;
+ static uint64_t gm_mem_pa;
+@@ -833,6 +850,27 @@
+ 		return false;
+ 	}
+ 	bool ok = true;
++	if (sweet_gpu_board.flame) {
++		/* No plan values for the A640: every level must resolve on this phone's cmd-db. */
++		for (unsigned i = 0; i < FL_GPU_LEVELS; ++i) {
++			if (!gmu_vote(gfx, ngfx, mx, nmx, fl_level_vlvl[i], &gm_gx_votes[i])) {
++				gm_gx_votes[i] = 0xffffffffu;
++				ok = false;
++			}
++			printf("SWEET GMU:   GPU perf %u: %6u kHz vlvl %3u vote 0x%08x%s\n", i, fl_level_khz[i],
++			    fl_level_vlvl[i], gm_gx_votes[i], gm_gx_votes[i] == 0xffffffffu ? " UNRESOLVED" : "");
++		}
++		for (unsigned i = 0; i < GMU_LEVELS; ++i) {
++			if (!gmu_vote(cx, ncx, mx, nmx, gmu_level_vlvl[i], &gm_cx_votes[i])) {
++				gm_cx_votes[i] = 0xffffffffu;
++				ok = false;
++			}
++			printf("SWEET GMU:   GMU perf %u: %6u kHz vlvl %3u vote 0x%08x\n", i, gmu_level_khz[i],
++			    gmu_level_vlvl[i], gm_cx_votes[i]);
++		}
++		gm_votes_ok = ok;
++		return ok;
++	}
+ 	for (unsigned i = 0; i < GPU_LEVELS; ++i) {
+ 		if (!gmu_vote(gfx, ngfx, mx, nmx, gpu_level_vlvl[i], &gm_gx_votes[i])) {
+ 			gm_gx_votes[i] = 0xffffffffu;
+@@ -871,6 +909,12 @@
+ bool
+ sweet_gmu_gx_on(void)
+ {
++	if (sweet_gpu_board.flame) {
++		printf("SWEET GMU: 2B.4 (A640, non-legacy): perf votes only; the firmware powers GX at OOB GPU_SET\n");
++		bool ok = gmu_votes();
++		printf("SWEET GMU: 2B.4 %s\n", ok ? "done" : "stopped: perf votes");
++		return ok;
++	}
+ 	printf("SWEET GMU: 2B.4 GX rail through the GMU (gfx_rail_on), then SPTPRAC\n");
+ 	if (!gmu_votes()) {
+ 		printf("SWEET GMU: 2B.4 stopped: perf votes\n");
+@@ -921,7 +965,11 @@
+ 			gm_rsp[i] = w;
+ 		}
+ 	}
+-	mem_wr(h + 4u * QH_READ, (rd + size) % HFI_QUEUE_DWORDS);
++	uint32_t next = (rd + size) % HFI_QUEUE_DWORDS;
++	if (sweet_gpu_board.flame) {
++		next = ((next + 3u) & ~3u) % HFI_QUEUE_DWORDS;  /* non-legacy: messages start 4-aligned */
++	}
++	mem_wr(h + 4u * QH_READ, next);
+ 	return size;
+ }
+ 
+@@ -960,7 +1008,13 @@
+ 	for (unsigned i = 0; i < dwords; ++i) {
+ 		mem_wr(q + 4u * ((wr + i) % HFI_QUEUE_DWORDS), gm_msg[i]);
+ 	}
+-	mem_wr(h + 4u * QH_WRITE, (wr + dwords) % HFI_QUEUE_DWORDS);
++	uint32_t end = (wr + dwords) % HFI_QUEUE_DWORDS;
++	if (sweet_gpu_board.flame) {
++		for (; end % 4u; end = (end + 1u) % HFI_QUEUE_DWORDS) {
++			mem_wr(q + 4u * end, 0xfafafafau);      /* non-legacy cookie padding */
++		}
++	}
++	mem_wr(h + 4u * QH_WRITE, end);
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	gmu_wr(gm_gmu, REG_A6XX_GMU_HOST2GMU_INTR_SET, 1);
+ 	for (unsigned t = 0; t < GMU_TIMEOUT_US; t += 10) {
+@@ -1002,9 +1056,94 @@
+ 	}
+ }
+ 
++/* flame 2B.5: mainline a6xx_hfi_start for non-legacy GMUs. */
++static bool
++gmu_hfi_v2(void)
++{
++	printf("SWEET GMU: 2B.5 HFI v2 (A640): start, PERF_TABLE, BW_TABLE, CORE_FW_START, START\n");
++	if (!gm_votes_ok) {
++		printf("SWEET GMU: 2B.5 needs 2B.4\n");
++		return false;
++	}
++	static const char *const bcm[4] = { "MC0", "SH0", "ACV", "CN0" };
++	for (unsigned i = 0; i < 4; ++i) {
++		uint32_t a = 0;
++		if (!gmu_cmddb(bcm[i], CMDDB_BCM, &a, NULL, 0, NULL)) {
++			printf("SWEET GMU:   cmd-db BCM %s at %#x (for comparison with mainline's a640 table)\n", bcm[i], a);
++		}
++	}
++	gpu_pause("HFI start (HFI_CTRL_INIT = 1)");
++	gmu_wr(gm_gmu, REG_A6XX_GMU_HFI_CTRL_INIT, 1);
++	bool ok = gmu_wait(REG_A6XX_GMU_HFI_CTRL_STATUS, 1, 1, GMU_TIMEOUT_US);
++	uint32_t ver = gmu_rd(gm_gmu, REG_A6XX_GMU_HFI_VERSION_INFO);
++	printf("SWEET GMU:   HFI_CTRL_STATUS 0x%08x (%s), HFI_VERSION_INFO 0x%08x (major %u)\n",
++	    gmu_rd(gm_gmu, REG_A6XX_GMU_HFI_CTRL_STATUS), ok ? "up" : "NOT UP in 100 ms", ver, ver >> 28);
++	if (!ok) {
++		printf("SWEET GMU: 2B.5 stopped: HFI did not start\n");
++		return false;
++	}
++
++	gpu_pause("HFI PERF_TABLE v2 (6 GPU levels with acd off, 2 GMU levels)");
++	gmu_msg_clear();
++	gm_msg[1] = FL_GPU_LEVELS;
++	gm_msg[2] = GMU_LEVELS;
++	for (unsigned i = 0; i < FL_GPU_LEVELS; ++i) {
++		gm_msg[3u + 3u * i] = gm_gx_votes[i];
++		gm_msg[4u + 3u * i] = 0xffffffffu;              /* acd: off */
++		gm_msg[5u + 3u * i] = fl_level_khz[i];
++	}
++	for (unsigned i = 0; i < GMU_LEVELS; ++i) {
++		gm_msg[3u + 3u * HFI_MAX_GX_LEVELS + 2u * i] = gm_cx_votes[i];
++		gm_msg[4u + 3u * HFI_MAX_GX_LEVELS + 2u * i] = gmu_level_khz[i];
++	}
++	if (!gmu_hfi_send(H2F_MSG_PERF_TBL, HFI_PERF_V2_DWORDS, "PERF_TABLE", NULL)) {
++		return false;
++	}
++
++	/* a640_build_bw_table: one "off" level; DDR and CNOC command addresses as mainline fixes them. */
++	gpu_pause("HFI BW_TABLE (mainline a640 table: one off level)");
++	gmu_msg_clear();
++	gm_msg[1] = 1;                  /* bw_level_num */
++	gm_msg[2] = 3;                  /* cnoc_cmds_num */
++	gm_msg[3] = 3;                  /* ddr_cmds_num */
++	gm_msg[4] = 1;                  /* cnoc_wait_bitmask */
++	gm_msg[5] = 1;                  /* ddr_wait_bitmask */
++	static const uint32_t cnoc_addr[3] = { 0x50034u, 0x5007cu, 0x5004cu };
++	static const uint32_t cnoc_off[3] = { 0x40000000u, 0x00000000u, 0x40000000u };
++	static const uint32_t cnoc_on[3] = { 0x60000001u, 0x20000001u, 0x60000001u };
++	static const uint32_t ddr_addr[3] = { 0x50000u, 0x5003cu, 0x5000cu };
++	for (unsigned i = 0; i < 3; ++i) {
++		gm_msg[6u + i] = cnoc_addr[i];
++		gm_msg[12u + i] = cnoc_off[i];
++		gm_msg[18u + i] = cnoc_on[i];
++		gm_msg[24u + i] = ddr_addr[i];
++		gm_msg[32u + i] = 0x40000000u;
++	}
++	if (!gmu_hfi_send(H2F_MSG_BW_VOTE_TBL, HFI_MSG_MAX, "BW_TABLE", NULL)) {
++		return false;
++	}
++
++	gpu_pause("HFI CORE_FW_START");
++	gmu_msg_clear();
++	if (!gmu_hfi_send(H2F_MSG_CORE_FW_START, 2, "CORE_FW_START", NULL)) {
++		return false;
++	}
++	gpu_pause("HFI START");
++	gmu_msg_clear();
++	if (!gmu_hfi_send(H2F_MSG_START, 1, "START", NULL)) {
++		return false;
++	}
++	sweet_gmu_status("after HFI v2");
++	printf("SWEET GMU: 2B.5 done: HFI v2 up, all four messages acked\n");
++	return true;
++}
++
+ bool
+ sweet_gmu_hfi(void)
+ {
++	if (sweet_gpu_board.flame) {
++		return gmu_hfi_v2();
++	}
+ 	printf("SWEET GMU: 2B.5 HFI v1: start, INIT, FW_VER, PERF_TBL, BW_TBL, TEST\n");
+ 	if (!gm_votes_ok) {
+ 		printf("SWEET GMU: 2B.5 needs 2B.4\n");
+@@ -1106,6 +1245,28 @@
+ bool
+ sweet_gmu_oob_gpu(void)
+ {
++	if (sweet_gpu_board.flame) {
++		/* Mainline order: a6xx_gmu_set_initial_freq (HFI vote) at resume, then hw_init's OOB GPU_SET. */
++		printf("SWEET GMU: 2B.6 (A640): GX_BW_PERF_VOTE to perf %u (%u kHz), then OOB GPU_SET\n",
++		    GPU_LEVEL_START, fl_level_khz[GPU_LEVEL_START]);
++		gpu_pause("HFI GX_BW_PERF_VOTE (blocking, bw 0)");
++		gmu_msg_clear();
++		gm_msg[1] = 1;                          /* ack_type: blocking */
++		gm_msg[2] = GPU_LEVEL_START;            /* freq: perf index */
++		gm_msg[3] = 0;                          /* bw */
++		bool ok = gmu_hfi_send(H2F_MSG_GX_BW_PERF_VOTE, 4, "GX_BW_PERF_VOTE", NULL);
++		gpu_pause("OOB GPU_SET (HOST2GMU bit 30, ack bit 31): the GMU powers GX for the host");
++		const uint32_t ack = 1u << OOB_GPU_ACK_NEW;
++		gmu_wr(gm_gmu, REG_A6XX_GMU_HOST2GMU_INTR_SET, 1u << OOB_GPU_SET_NEW);
++		bool acked = gmu_wait(REG_A6XX_GMU_GMU2HOST_INTR_INFO, ack, ack, GMU_TIMEOUT_US);
++		printf("SWEET GMU:   OOB GPU_SET (bit %u): %s, GMU2HOST_INTR_INFO 0x%08x\n", OOB_GPU_SET_NEW,
++		    acked ? "acked" : "NO ACK in 100 ms", gmu_rd(gm_gmu, REG_A6XX_GMU_GMU2HOST_INTR_INFO));
++		if (acked) {
++			gmu_wr(gm_gmu, REG_A6XX_GMU_GMU2HOST_INTR_CLR, ack);
++		}
++		sweet_gmu_status("after OOB GPU_SET");
++		return ok && acked;
++	}
+ 	printf("SWEET GMU: 2B.6 OOB_GPU, then DCVS through the registers\n");
+ 	gpu_pause("OOB_GPU (HOST2GMU bit 16): GX stays on for the host");
+ 	if (!gmu_oob_set(OOB_GPU, "gpu")) {
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1074,6 +1074,12 @@
+ {
+ 	bool gdsc = (gpu_rd(cc, GPUCC_GX_GDSCR) & GDSC_PWR_ON) != 0;
+ 	gpu_log_gx(cc, gmu, when, gdsc);
++	if (sweet_gpu_board.flame) {
++		/* The clock counter's GCC/gpucc debug-mux values are SM7150's; flame judges GX by the
++		 * GDSC here and by the CP always-on counter in gpu_gx_reads. */
++		printf("SWEET GPU: %s: GX GDSC %s (flame: no clock counter)\n", when, gdsc ? "on" : "OFF");
++		return gdsc;
++	}
+ 	uint32_t khz[MEAS_ALL] = { 0 };
+ 	gpu_pause(gdsc ? "clock counter (GCC 0x162000): cx_gmu, gx_gfx3d, cx_gfx3d, gx_cxo, gx_gmu" :
+ 	    "clock counter (GCC 0x162000): cx_gmu only, GX GDSC off");
+@@ -1149,7 +1155,11 @@
+ 	if (ok && gpu_gmu_stop >= 4) {
+ 		step = 4;
+ 		ok = sweet_gmu_gx_on();
+-		ok = gpu_gx_check(gcc, cc, gmu, "after GMU rail") && ok;
++		if (sweet_gpu_board.flame) {
++			gpu_log_gx(cc, gmu, "after 2B.4 (A640: GX comes at OOB GPU_SET)", false);
++		} else {
++			ok = gpu_gx_check(gcc, cc, gmu, "after GMU rail") && ok;
++		}
+ 	}
+ 	if (ok && gpu_gmu_stop >= 5) {
+ 		step = 5;
+@@ -1332,10 +1342,7 @@
+ 	if (sweet_gpu_board.flame) {
+ 		/* A640 (non-legacy GMU, HFI v2): 2B.4+ still speak the A618's legacy protocol. Mainline
+ 		 * starts the RSCC before every cold boot, so flame always does. */
+-		if (gpu_gmu_stop > 3) {
+-			printf("SWEET GPU: flame: GMU steps after 2B.3 are not ported; sweetgmu=%d -> 3\n", gpu_gmu_stop);
+-			gpu_gmu_stop = 3;
+-		}
++		/* 2B.0-2B.6 are ported (HFI v2 for 2B.4-2B.6). */
+ 		gpu_gmu_rsc = 1;
+ 	}
+ 	(void)PE_parse_boot_argn("sweetcp", &gpu_cp_stop, sizeof(gpu_cp_stop));
