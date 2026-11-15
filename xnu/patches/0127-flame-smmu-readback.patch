@@ -1,0 +1,22 @@
+--- a/bsd/dev/sweet_smmu.c
++++ b/bsd/dev/sweet_smmu.c
+@@ -411,13 +411,17 @@
+ 	gpu_wr(cb, CB_SCTLR, SCTLR_VALUE);
+ 	ok = smmu_check("CBA2R", gpu_rd(gr1, SMMU_CBA2R(n)), CBA2R_VA64, CBA2R_VA64) && ok;
+ 	ok = smmu_check("CBAR", gpu_rd(gr1, SMMU_CBAR(n)), cbar, CBAR_CHECKED) && ok;
+-	ok = smmu_check("TCR2", gpu_rd(cb, CB_TCR2), tcr2, 0xffffffffu) && ok;
++	/* flame (qsmmu-v500) sets TCR2 bits 6:5 by itself (0x38015 reads 0x38075); not ours, not checked. */
++	ok = smmu_check("TCR2", gpu_rd(cb, CB_TCR2), tcr2, ~0x60u) && ok;
+ 	ok = smmu_check("TCR", gpu_rd(cb, CB_TCR), tcr, 0xffffffffu) && ok;
+ 	ok = smmu_check("MAIR0", gpu_rd(cb, CB_MAIR0), MAIR0_VALUE, 0xffffffffu) && ok;
+ 	uint64_t t = smmu_rd64(cb, CB_TTBR0);
+ 	ok = smmu_check("TTBR0 lo", (uint32_t)t, (uint32_t)ttbr0, 0xffffffffu) && ok;
+ 	ok = smmu_check("TTBR0 hi", (uint32_t)(t >> 32), (uint32_t)(ttbr0 >> 32), 0xffffffffu) && ok;
+-	ok = smmu_check("SCTLR", gpu_rd(cb, CB_SCTLR), SCTLR_VALUE, SCTLR_VALUE | (1u << 6) | (1u << 7)) && ok;
++	/* ASIDPNE reads 0 on flame's qsmmu-v500 (0x1027 reads 0x27): ASIDs are not namespaced there, and
++	 * each bank's ASID is its own index, so nothing depends on it. M, TRE, AFE, CFRE must stick. */
++	ok = smmu_check("SCTLR", gpu_rd(cb, CB_SCTLR), SCTLR_VALUE,
++	    (SCTLR_VALUE & ~SCTLR_ASIDPNE) | (1u << 6) | (1u << 7)) && ok;
+ 	if (!ok) {
+ 		gpu_wr(cb, CB_SCTLR, 0);
+ 		printf("SWEET SMMU: bank %u did not take; translation off again, no stream points at it\n", n);
