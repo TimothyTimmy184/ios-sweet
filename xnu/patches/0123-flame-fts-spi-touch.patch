@@ -1,9 +1,11 @@
 --- a/bsd/dev/sweet_touch.c
 +++ b/bsd/dev/sweet_touch.c
-@@ -59,6 +59,37 @@
+@@ -57,6 +57,37 @@
+ #define FTS5_EVT_LEAVE  0x33u
+ #define FTS5_MAX_X      1079
  #define FTS5_MAX_Y      2339    /* st,max-coords <1079 2339> */
- 
- /*
++
++/*
 + * Pixel 4 (flame, boot-arg sweetfts=2): the same FTM5 family on SPI.
 + * DT spi@890000 = QUPv3 wrapper 0 SE4 (TLMM 51-54, function qup4, 6 mA),
 + * touchscreen@0 = CS0, SPI mode 0, max 10 MHz. Google's coral fts_touch SPI
@@ -33,11 +35,9 @@
 +#define SPI_FRAG        (1u << 2)
 +/* GENI M_IRQ: overrun, illegal, failure, cancel, abort, FIFO rd/wr errors. No GP bits. */
 +#define SPI_ERRORS      (0x3eu | (3u << 24) | (3u << 28))
-+
-+/*
+ 
+ /*
   * Touch power on sunfish: PM6150 (SID 0) GPIO4, DT touch_power_default
-  * (function normal, output-high, power-source 1, drive 2, bias-disable).
-  * SPMI PMIC arbiter v5 (sdmmagpie.dtsi spmi_bus): reads through the observer
 @@ -106,8 +137,9 @@
  #define SE_PACK1        0x000ffefeu
  
@@ -168,9 +168,9 @@
 +		memcpy(buf, raw + 1, len);
 +	}
 +	return err;
-+}
-+
-+static int
+ }
+ 
+ static int
 +fl_write(const uint8_t *tx, unsigned n)
 +{
 +	int err = fl_spi(SPI_CS_ASSERT, 0, NULL, 0, NULL, 0);
@@ -188,9 +188,9 @@
 +{
 +	return st.flame ? fl_read(FL_FIFO_READ, buf, len) :
 +	       touch_read(FTS5_ADDR, FTS5_FIFO_READ, false, buf, len);
- }
- 
- static int
++}
++
++static int
 +fts_cmd(const uint8_t *tx, unsigned n)
 +{
 +	return st.flame ? fl_write(tx, n) : touch_msg(FTS5_ADDR, tx, n, NULL, 0, false);
@@ -258,7 +258,7 @@
  	printf("SWEET FTS: scan mode active err=%d\n", err);
  	return err == 0;
  }
-@@ -773,6 +951,153 @@
+@@ -773,8 +951,163 @@
  	touch_wait(50);         /* rail settle before reset */
  	printf("SWEET FTS: pwr write err=%d status=%#x\n", fp.write_err, fp.status);
  	fp_dump("after");
@@ -309,6 +309,14 @@
 +	printf("SWEET FTS: se4 clock level=%u cfg=%#x <= %u Hz\n", st.clk_level, cfg, st.se_hz);
 +	const uint32_t branches[] = {0x17604, 0x17004, 0x17008};     /* SE4, m-ahb, s-ahb */
 +	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); ++i) {
++		uint32_t v = touch_rd(st.gcc, branches[i]);
++		if (v & 2u) {
++			/* HW_CTL: hardware gates this clock on demand, so CLK_OFF may read
++			 * set while idle (s-ahb read 0x80000002 on flame). Linux
++			 * clk_branch skips the halt check in this mode; so do we. */
++			printf("SWEET FTS: GCC branch %#x hw-gated (%#x)\n", branches[i], v);
++			continue;
++		}
 +		if (!touch_wait_clear(st.gcc, branches[i], 1u << 31)) {
 +			printf("SWEET FTS: GCC branch %#x halted (%#x)\n", branches[i],
 +			    touch_rd(st.gcc, branches[i]));
@@ -316,8 +324,8 @@
 +		}
 +	}
 +	return true;
-+}
-+
+ }
+ 
 +/* SE4 as Linux spi-geni sets it up for FIFO mode: mode 0, CS0, 8-bit words. */
 +static bool
 +fl_se_init(void)
@@ -409,10 +417,12 @@
 +	int avdd = sweet_rpmh_vreg_enable("ldoa17", 2856);
 +	touch_wait(15);
 +	printf("SWEET FTS: vdd L14 err=%d avdd L17 err=%d\n", vdd, avdd);
- }
- 
++}
++
  /*
-@@ -783,12 +1108,16 @@
+  * The sunfish path never stops quietly: whatever fails, one status line every
+  * 5 s keeps the reason on the (fast-scrolling) console.
+@@ -783,12 +1116,16 @@
  touch_fts5_main(void)
  {
  	const char *stage = "clocks";
@@ -433,7 +443,7 @@
  	bool up = false;
  	for (unsigned round = 0; !st.dead; ++round) {
  		if (bus && !up && (round % 6u) == 0) {  /* retry bring-up every 30 s */
-@@ -807,6 +1136,14 @@
+@@ -807,6 +1144,14 @@
  		} else {
  			touch_wait(5000);
  		}
@@ -448,7 +458,7 @@
  		printf("SWEET FTS: [%s] se7 fw=%#x bus=%d reads=%u nacks=%u events=%u err=%d active=%#x tlmm8/9/72=%x/%x/%x pwr en=%#x src=%#x w=%d\n",
  		    stage, touch_rd(st.se, SE_FW), bus, st.fts5_reads, st.fts5_nacks, st.fts5_events,
  		    st.fts5_err, st.active, touch_rd(st.gpio, TOUCH_GPIO_IO(8)),
-@@ -887,11 +1224,18 @@
+@@ -887,11 +1232,18 @@
  	(void)PE_parse_boot_argn("sweettouchdelay", &delay_s, sizeof(delay_s));
  	printf("SWEET TOUCH: starting in %u s\n", delay_s);
  	touch_wait(delay_s * 1000u);
@@ -471,7 +481,7 @@
  		printf("SWEET TOUCH: MMIO mapping failed\n");
  		goto out;
  	}
-@@ -981,6 +1325,8 @@
+@@ -981,6 +1333,8 @@
  	(void)PE_parse_boot_argn("sweettouchirq", &st.irq_hint, sizeof(st.irq_hint));
  	(void)PE_parse_boot_argn("sweetfts", &st.fts5, sizeof(st.fts5));
  	(void)PE_parse_boot_argn("sweetftspower", &st.fts5_power, sizeof(st.fts5_power));
