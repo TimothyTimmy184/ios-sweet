@@ -1,0 +1,31 @@
+--- a/bsd/dev/sweet_gmu.c
++++ b/bsd/dev/sweet_gmu.c
+@@ -166,7 +166,8 @@
+ #define HFI_CMD_Q               0u
+ #define HFI_MSG_Q               1u
+ #define HFI_MSG_CMD             0u
+-#define HFI_F2H_MSG_ACK         126u            /* header bits 7:0 of an ack */
++#define HFI_F2H_MSG_ACK         126u            /* header bits 7:0 of an ack (v1) */
++#define HFI_F2H_MSG_ERROR       100u            /* v2: firmware error report, not an ack */
+ #define HFI_SEQNUM(hdr)         ((hdr) >> 20)
+ #define HFI_IRQ_MSGQ            (1u << 0)
+ #define H2F_MSG_INIT            0u
+@@ -1025,7 +1026,17 @@
+ 		gmu_wr(gm_gmu, REG_A6XX_GMU_GMU2HOST_INTR_CLR, HFI_IRQ_MSGQ);
+ 		unsigned n;
+ 		while ((n = gmu_hfi_read())) {
+-			if ((gm_rsp[0] & 0xffu) != HFI_F2H_MSG_ACK || n < 3 || HFI_SEQNUM(gm_rsp[1]) != HFI_SEQNUM(hdr)) {
++			/*
++			 * v1 acks have id 126. v2 (flame G5: 0x00010304 0x00103b04 0x00000000 for PERF_TABLE)
++			 * echo the command's id with type ACK; mainline a6xx_hfi_wait_for_ack skips only
++			 * F2H_MSG_ERROR (id 100) and matches the sequence number in the returned header.
++			 */
++			bool is_ack = sweet_gpu_board.flame ? (gm_rsp[0] & 0xffu) != HFI_F2H_MSG_ERROR :
++			    (gm_rsp[0] & 0xffu) == HFI_F2H_MSG_ACK;
++			if (sweet_gpu_board.flame && (gm_rsp[0] & 0xffu) == HFI_F2H_MSG_ERROR) {
++				gmu_hfi_dump(name, "GMU firmware error", n);
++			}
++			if (!is_ack || n < 3 || HFI_SEQNUM(gm_rsp[1]) != HFI_SEQNUM(hdr)) {
+ 				gmu_hfi_dump(name, "skipped", n);
+ 				continue;
+ 			}
