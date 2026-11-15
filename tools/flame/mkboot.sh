@@ -17,7 +17,19 @@ K="$1/kernel.development.sweet"; NAME=$2; EXTRA=${3:-}
 # Read-only first boot: no ufsrw/rootrw, no persistent log ring on userdata.
 B="debug=0xc serial=3 cpus=${CPUS:-1} keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin launchd_unsecure_cache=1 wdt=-1 ${TOUCH:-sweettouch=1 sweetfts=2 sweettouchdelay=20 sweetkeys=2} sweetlog=${SWEETLOG:-0} $EXTRA"
 [ -f shim/out/flame-hi.adt ] || python3 -I tools/mkadt.py shim/out/flame-hi.adt --highmem --flame
-python3 -I tools/mkpayload.py "$K" "${ADT:-shim/out/flame-hi.adt}" shim/out/payload-$NAME.bin --cmdline "$B"
+# GPUFW=1 adds the Adreno 640 firmware from $GPUFW_DIR (default ~/ios-pixel/fw, pulled from the
+# phone's vendor_b) as payload blobs for sweet_gpu.c/sweet_gmu.c (kernel 0126+), plus GPU-GMU-MEM
+# (1 MiB of zeros). Such images contain Qualcomm firmware: keep them out of git.
+BLOBS=()
+if [ "${GPUFW:-0}" = 1 ]; then
+  FW=${GPUFW_DIR:-$HOME/ios-pixel/fw}
+  for b in GPU-SQE=a630_sqe.fw GPU-GMU=a640_gmu.bin GPU-ZAP-MDT=a640_zap.mdt GPU-ZAP-B02=a640_zap.b02; do
+    BLOBS+=(--blob "${b%%=*}=$FW/${b#*=}")
+  done
+  head -c 1048576 /dev/zero > shim/out/gmu-mem.bin
+  BLOBS+=(--blob GPU-GMU-MEM=shim/out/gmu-mem.bin)
+fi
+python3 -I tools/mkpayload.py "$K" "${ADT:-shim/out/flame-hi.adt}" shim/out/payload-$NAME.bin --cmdline "$B" "${BLOBS[@]}"
 rm -f shim/out/shim-boot.img
 BOARD=flame bash shim/build.sh "$R/shim/out/payload-$NAME.bin" > /tmp/shim-build.log 2>&1 || { tail -5 /tmp/shim-build.log; exit 1; }
 cp shim/out/shim-boot.img shim/out/shim-boot-$NAME.img

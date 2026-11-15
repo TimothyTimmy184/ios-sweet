@@ -1,0 +1,310 @@
+--- a/bsd/dev/sweet_gpu_internal.h
++++ b/bsd/dev/sweet_gpu_internal.h
+@@ -20,7 +20,7 @@
+  * sweet_gpu_regs.h offsets are dwords from GPU_PA.
+  */
+ struct sweet_gpu_board {
+-	uint32_t gpu_pa, gmu_pa, gpucc_pa, cx_misc_pa, ddrss_axi_cbcr;
++	uint32_t gpu_pa, gmu_pa, gpucc_pa, cx_misc_pa, ddrss_axi_cbcr, smmu_pa;
+ 	uint32_t speed_bin_off, speed_bin_mask, speed_bin_shift;
+ 	int flame;
+ };
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -252,7 +252,7 @@
+  */
+ struct sweet_gpu_board sweet_gpu_board = {
+ 	.gpu_pa = 0x05000000u, .gmu_pa = 0x0506a000u, .gpucc_pa = 0x05090000u,
+-	.cx_misc_pa = 0x0509e000u, .ddrss_axi_cbcr = 0x4452cu,
++	.cx_misc_pa = 0x0509e000u, .ddrss_axi_cbcr = 0x4452cu, .smmu_pa = 0x05040000u,
+ 	.speed_bin_off = 0x41a0u, .speed_bin_mask = 0x1fe00000u, .speed_bin_shift = 21,
+ };
+ 
+@@ -1117,7 +1117,8 @@
+ {
+ 	printf("SWEET GPU: stage 2B (sweetgpu=%d sweetgmu=%d%s): the GMU firmware powers GX\n", gpu_level,
+ 	    gpu_gmu_stop, gpu_gmu_rsc == 1 ? " sweetgmursc=1" : "");
+-	if (bin != (int)GPU_BIN_2B) {
++	/* The bin selects the A618 perf table used from 2B.4; flame stops at 2B.3. */
++	if (!sweet_gpu_board.flame && bin != (int)GPU_BIN_2B) {
+ 		printf("SWEET GPU: stage 2B stopped: speed bin %d; the GMU perf table is for bin %u\n", bin, GPU_BIN_2B);
+ 		return false;
+ 	}
+@@ -1299,16 +1300,17 @@
+ 	if (board == 2) {
+ 		sweet_gpu_board = (struct sweet_gpu_board){
+ 			.gpu_pa = 0x02c00000u, .gmu_pa = 0x02c6a000u, .gpucc_pa = 0x02c90000u,
+-			.cx_misc_pa = 0x02c9e000u, .ddrss_axi_cbcr = 0x71154u,
++			.cx_misc_pa = 0x02c9e000u, .ddrss_axi_cbcr = 0x71154u, .smmu_pa = 0x02ca0000u,
+ 			.speed_bin_off = 0x4130u, .speed_bin_mask = 0xe0000000u, .speed_bin_shift = 29,
+ 			.flame = 1,
+ 		};
+ 		gpu_gcc_branches[0].cbcr = sweet_gpu_board.ddrss_axi_cbcr;
+-		/* Stage 2+ (rails, GMU firmware, SMMU, CP, zap) still carry A618 values. */
+-		if (gpu_level > 2) {
+-			printf("SWEET GPU: flame (Adreno 640): only stages 0-1 are ported; sweetgpu=%d -> 2\n",
+-			    gpu_level);
+-			gpu_level = 2;
++		/* Ported: stages 0, 1 and 2B up to 2B.3 (GMU firmware boot). Not 2A (host-driven
++		 * GX, A618 PLL values) and not stage 3+; the GMU step is clamped below. */
++		if (gpu_level == 3 || gpu_level > 4) {
++			printf("SWEET GPU: flame (Adreno 640): ported stages are 0, 1 and 2B; sweetgpu=%d -> %d\n",
++			    gpu_level, gpu_level == 3 ? 2 : 4);
++			gpu_level = gpu_level == 3 ? 2 : 4;
+ 		}
+ 		printf("SWEET GPU: board flame: gpu %#x gmu %#x gpucc %#x cx_misc %#x\n",
+ 		    GPU_PA, GMU_PA, GPUCC_PA, CX_MISC_PA);
+@@ -1327,6 +1329,15 @@
+ 		gpu_gmu_stop = 0;
+ 	}
+ 	(void)PE_parse_boot_argn("sweetgmursc", &gpu_gmu_rsc, sizeof(gpu_gmu_rsc));
++	if (sweet_gpu_board.flame) {
++		/* A640 (non-legacy GMU, HFI v2): 2B.4+ still speak the A618's legacy protocol. Mainline
++		 * starts the RSCC before every cold boot, so flame always does. */
++		if (gpu_gmu_stop > 3) {
++			printf("SWEET GPU: flame: GMU steps after 2B.3 are not ported; sweetgmu=%d -> 3\n", gpu_gmu_stop);
++			gpu_gmu_stop = 3;
++		}
++		gpu_gmu_rsc = 1;
++	}
+ 	(void)PE_parse_boot_argn("sweetcp", &gpu_cp_stop, sizeof(gpu_cp_stop));
+ 	if (gpu_cp_stop < 0 || gpu_cp_stop > 6) {
+ 		gpu_cp_stop = 0;
+--- a/bsd/dev/sweet_gmu.c
++++ b/bsd/dev/sweet_gmu.c
+@@ -24,6 +24,15 @@
+  * IFPC, SPTP or NAP), so the GMU never collapses GX by itself. A step that
+  * fails leaves what it did in place, except the CM3, which goes back into
+  * reset when it does not start cleanly.
++ */
++/*
++ * flame (Adreno 640, sweetgpuboard=2), steps 2B.0 to 2B.3 only. Mainline's
++ * a6xx_gmu.c/a6xx_hfi.c treat the A640 as non-legacy: the firmware file is a
++ * list of blocks (addr, size, type, value, data) for ITCM, DTCM and the
++ * icache/dcache backing; the HFI message queue has id 1 (debug 2, DSP 3); the
++ * PDC TCS3 cx.lvl wake vote is 3; chip id 6.4.0.1 goes to the GMU as
++ * 0x06040100. The GMU streams are SID 4 and 5 with SMR mask 0x400 in the
++ * Pixel 4 DT, so flame matches 4, 5, 0x404 and 0x405 exactly (mask 0).
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -96,6 +105,7 @@
+ #define GMU_SPTPRAC_TIMEOUT_US  10000u          /* SPTPRAC_CTRL_TIMEOUT */
+ /* Stock DT: gmu_user SID 4, gmu_kernel SID 5, one iommu cell each, so mask 0 (a mask-1 SMR did not stick on G3b) */
+ static const uint32_t gmu_streams[] = { 4u, 5u };
++static const uint32_t gmu_streams_flame[] = { 4u, 5u, 0x404u, 0x405u };
+ #define SPTPRAC_POWER_ON        0x778000u
+ #define SPTPRAC_POWERON_STATUS  (1u << 3)
+ #define OOB_GPU                 0u
+@@ -170,6 +180,11 @@
+ 	{ 0x0a04u, 1 }, /* message: index 4, priority 10 (a615 family) */
+ 	{ 0x2805u, 1 }, /* debug: index 5, priority 40 */
+ 	{ 0x1401u, 0 }, /* DSP: index 1, priority 20, off */
++}, hfi_queues_flame[HFI_QUEUES] = {
++	{ 0x0a00u, 1 }, /* command: index 0 */
++	{ 0x0a01u, 1 }, /* message: index 1 (non-legacy) */
++	{ 0x2802u, 1 }, /* debug: index 2 */
++	{ 0x1403u, 0 }, /* DSP: index 3, off */
+ };
+ 
+ /*
+@@ -351,9 +366,9 @@
+ 	gm_mem_pa = mem_pa;
+ 	gm_mem_len = mem_len;
+ 	printf("SWEET GMU: 2B.0 survey: GPU SMMU, GMU, RSCC, PDC; nothing written\n");
+-	gpu_pause("GPU SMMU survey (0x5040000)");
++	gpu_pause("GPU SMMU survey");
+ 	bool smmu = sweet_smmu_survey();
+-	gpu_pause("GMU and RSCC register survey (0x506a000, 0x508d000)");
++	gpu_pause("GMU and RSCC register survey (GMU, GMU +0x23000)");
+ 	gmu_log_regs("GMU", gmu_survey_regs, sizeof(gmu_survey_regs) / sizeof(gmu_survey_regs[0]));
+ 	gmu_log_regs("RSCC", gmu_rscc_regs, sizeof(gmu_rscc_regs) / sizeof(gmu_rscc_regs[0]));
+ 	printf("SWEET GMU:   RSCC SEQ_MEM_0..4 %08x %08x %08x %08x %08x\n", gmu_rd(gmu, REG_A6XX_RSCC_SEQ_MEM_0_DRV0),
+@@ -396,7 +411,10 @@
+ bool
+ sweet_gmu_mem(void)
+ {
+-	printf("SWEET GMU: 2B.1 GMU memory and an SMMU bank for streams %u and %u\n", gmu_streams[0], gmu_streams[1]);
++	const uint32_t *streams = sweet_gpu_board.flame ? gmu_streams_flame : gmu_streams;
++	const unsigned nstreams = sweet_gpu_board.flame ? 4u : 2u;
++	printf("SWEET GMU: 2B.1 GMU memory and an SMMU bank for streams %u and %u%s\n", streams[0], streams[1],
++	    sweet_gpu_board.flame ? " (and 0x404, 0x405)" : "");
+ 	if (!gm_mem_pa || gm_mem_len < GMEM_USED || (gm_mem_pa & 0xfffu)) {
+ 		printf("SWEET GMU: GPU-GMU-MEM missing or too small (mkboot.sh GPUFW=1, tools 0100+)\n");
+ 		return false;
+@@ -421,8 +439,8 @@
+ 			return false;
+ 		}
+ 	}
+-	gpu_pause("SMMU context bank and stream match for the GMU (0x5040000)");
+-	gm_cb = sweet_smmu_attach(gmu_streams, sizeof(gmu_streams) / sizeof(gmu_streams[0]), gm_mem_pa, 32u, -1);
++	gpu_pause("SMMU context bank and stream match for the GMU");
++	gm_cb = sweet_smmu_attach(streams, nstreams, gm_mem_pa, 32u, -1);
+ 	if (gm_cb < 0) {
+ 		return false;
+ 	}
+@@ -474,7 +492,7 @@
+ static const uint32_t gmu_pdc_seq[5] = { 0xfebea1e1u, 0xa5a4a3a2u, 0x8382a6e0u, 0xbce3e284u, 0x002081fcu };
+ /* PDC TCS commands: mx.lvl, cx.lvl, xo.lvl hlvl for TCS1 (power down) and TCS3 (power up) */
+ static const char *const gmu_pdc_res[3] = { "mx.lvl", "cx.lvl", "xo.lvl" };
+-static const uint32_t gmu_pdc_data[2][3] = { { 1, 0, 0 }, { 2, 2, 3 } };
++static uint32_t gmu_pdc_data[2][3] = { { 1, 0, 0 }, { 2, 2, 3 } };      /* [1][1] = 3 on flame */
+ static const unsigned gmu_pdc_tcs[2] = { 1, 3 };
+ 
+ static bool
+@@ -522,7 +540,8 @@
+ 			return false;
+ 		}
+ 	}
+-	gpu_pause("GMU_GENERAL_7 = 1 (TCM retention), then the RSCC (0x508d000)");
++	gmu_pdc_data[1][1] = sweet_gpu_board.flame ? 3u : 2u;
++	gpu_pause("GMU_GENERAL_7 = 1 (TCM retention), then the RSCC (GMU +0x23000)");
+ 	bool ok = gmu_set("GENERAL_7", REG_A6XX_GMU_GENERAL_7, 1);
+ 	for (unsigned i = 0; i < sizeof(gmu_rscc_init) / sizeof(gmu_rscc_init[0]); ++i) {
+ 		ok = (gmu_rscc_init[i].kept ? gmu_set_or_kept : gmu_set)(gmu_rscc_init[i].name, gmu_rscc_init[i].reg,
+@@ -535,7 +554,7 @@
+ 		printf("SWEET GMU: 2B.2 stopped: RSCC write did not read back\n");
+ 		return false;
+ 	}
+-	gpu_pause("PDC sequencer and TCS1/TCS3 commands (0xb490000, 0xb290000)");
++	gpu_pause("PDC sequencer and TCS1/TCS3 commands (0xb490000, 0xb290000; same on SM7150 and SM8150)");
+ 	for (unsigned i = 0; i < 5; ++i) {
+ 		ok = gmu_pdc_set(gm_pdc_seq, i, gmu_pdc_seq[i]) && ok;
+ 	}
+@@ -570,9 +589,11 @@
+ 	}
+ 	for (unsigned q = 0; q < HFI_QUEUES; ++q) {
+ 		uint32_t h = HFI_QHDR(q);
+-		mem_wr(h + 4u * QH_STATUS, hfi_queues[q].status);
++		const uint32_t status = sweet_gpu_board.flame ? hfi_queues_flame[q].status : hfi_queues[q].status;
++		const uint32_t type = sweet_gpu_board.flame ? hfi_queues_flame[q].type : hfi_queues[q].type;
++		mem_wr(h + 4u * QH_STATUS, status);
+ 		mem_wr(h + 4u * QH_START, GMU_VA_HFI + HFI_QUEUE(q));
+-		mem_wr(h + 4u * QH_TYPE, hfi_queues[q].type);
++		mem_wr(h + 4u * QH_TYPE, type);
+ 		mem_wr(h + 4u * QH_SIZE, HFI_QUEUE_DWORDS);
+ 		mem_wr(h + 4u * QH_RX_WM, 1);
+ 		mem_wr(h + 4u * QH_TX_WM, 1);
+@@ -609,6 +630,69 @@
+ 	    gmu_rd(gm_gmu, REG_A6XX_GPU_GMU_CX_GMU_RPMH_POWER_STATE),
+ 	    gmu_rd(gm_gmu, REG_A6XX_GMU_SPTPRAC_PWR_CLK_STATUS), gmu_rd(gm_gmu, REG_A6XX_GMU_HFI_CTRL_STATUS));
+ 	(void)sweet_smmu_faults(gm_cb, when);
++}
++
++/*
++ * A640 firmware (mainline a6xx_gmu_fw_load, non-legacy): blocks of {addr, size, type, value}
++ * then size bytes. ITCM at GMU address 0, DTCM at 0x40000 (16 KiB each); other blocks go to
++ * the icache/dcache/dummy backing in GPU-GMU-MEM by their GMU address (gmu_regions). TCM
++ * writes are read back; a block that fits nowhere stops the load.
++ */
++static bool
++gmu_fw_blocks(const uint8_t *fw, uint32_t len)
++{
++	unsigned nblk = 0, tcm_words = 0, mem_words = 0, bad = 0;
++	uint32_t off = 0;
++	while (off + 16u <= len) {
++		uint32_t addr = fw32(fw + off), size = fw32(fw + off + 4u);
++		const uint8_t *data = fw + off + 16u;
++		if (size > len - off - 16u || (size & 3u)) {
++			printf("SWEET GMU:   block %u at file +%#x: size %#x runs past the file\n", nblk, off, size);
++			return false;
++		}
++		const char *where = "NOWHERE";
++		if (size == 0) {
++			where = "empty";
++		} else if (addr + size <= 0x4000u) {
++			for (uint32_t i = 0; i < size / 4u; ++i) {
++				uint32_t reg = REG_A6XX_GMU_CM3_ITCM_START + addr / 4u + i;
++				gmu_wr(gm_gmu, reg, fw32(data + 4u * i));
++				bad += gmu_rd(gm_gmu, reg) != fw32(data + 4u * i);
++			}
++			tcm_words += size / 4u;
++			where = "ITCM";
++		} else if (addr >= 0x40000u && addr + size <= 0x44000u) {
++			for (uint32_t i = 0; i < size / 4u; ++i) {
++				uint32_t reg = REG_A6XX_GMU_CM3_DTCM_START + (addr - 0x40000u) / 4u + i;
++				gmu_wr(gm_gmu, reg, fw32(data + 4u * i));
++				bad += gmu_rd(gm_gmu, reg) != fw32(data + 4u * i);
++			}
++			tcm_words += size / 4u;
++			where = "DTCM";
++		} else {
++			for (unsigned r = 0; r < sizeof(gmu_regions) / sizeof(gmu_regions[0]); ++r) {
++				if (addr >= gmu_regions[r].iova && addr + size <= gmu_regions[r].iova + gmu_regions[r].len) {
++					uint32_t m = gmu_regions[r].off + (addr - gmu_regions[r].iova);
++					for (uint32_t i = 0; i < size / 4u; ++i) {
++						mem_wr(m + 4u * i, fw32(data + 4u * i));
++					}
++					mem_words += size / 4u;
++					where = gmu_regions[r].name;
++					break;
++				}
++			}
++		}
++		printf("SWEET GMU:   block %u: addr %#010x size %#06x -> %s\n", nblk, addr, size, where);
++		if (where[0] == 'N') {
++			return false;
++		}
++		off += 16u + size;
++		++nblk;
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	printf("SWEET GMU:   %u blocks, %u TCM words (%u differ on read-back), %u backing words, %u of %u file bytes\n",
++	    nblk, tcm_words, bad, mem_words, off, len);
++	return bad == 0 && off == len && nblk > 0;
+ }
+ 
+ bool
+@@ -619,7 +703,7 @@
+ 		printf("SWEET GMU: 2B.3 needs 2B.1\n");
+ 		return false;
+ 	}
+-	if (!fw || len != GMU_TCM_BYTES) {
++	if (!fw || (!sweet_gpu_board.flame && len != GMU_TCM_BYTES)) {
+ 		printf("SWEET GMU: GPU-GMU is %u bytes, expected %u (16 KiB ITCM + 16 KiB DTCM)\n", len, GMU_TCM_BYTES);
+ 		return false;
+ 	}
+@@ -629,6 +713,13 @@
+ 		return false;
+ 	}
+ 	gmu_hfi_table_init();
++	if (sweet_gpu_board.flame) {
++		gpu_pause("A640 firmware blocks into ITCM, DTCM and the cache backing");
++		if (!gmu_fw_blocks(fw, len)) {
++			printf("SWEET GMU: 2B.3 stopped: firmware blocks\n");
++			return false;
++		}
++	} else {
+ 	gpu_pause("firmware into the GMU ITCM and DTCM (0x506d000, 32 KiB)");
+ 	const unsigned words = len / 4u;
+ 	for (unsigned i = 0; i < words; ++i) {
+@@ -646,6 +737,7 @@
+ 		    gmu_rd(gm_gmu, REG_A6XX_GMU_CM3_ITCM_START + first), fw32(fw + 4u * first));
+ 		return false;
+ 	}
++	}
+ 	gpu_pause("boot registers (HFI table, fence, chip id, log, power config)");
+ 	bool ok = gmu_set("CM3_FW_INIT_RESULT", REG_A6XX_GMU_CM3_FW_INIT_RESULT, 0);
+ 	ok = gmu_set("CM3_BOOT_CONFIG", REG_A6XX_GMU_CM3_BOOT_CONFIG, 2) && ok;
+@@ -653,7 +745,9 @@
+ 	ok = gmu_set("HFI_QTBL_INFO", REG_A6XX_GMU_HFI_QTBL_INFO, 1) && ok;
+ 	ok = gmu_set("AHB_FENCE_RANGE_0", REG_A6XX_GMU_AHB_FENCE_RANGE_0, 0x80a008a0u) && ok;
+ 	ok = gmu_set("CM3_CFG", REG_A6XX_GMU_CM3_CFG, 0x4052) && ok;
+-	ok = gmu_set("HFI_SFR_ADDR", REG_A6XX_GMU_HFI_SFR_ADDR, 0x06018000u) && ok;   /* chip id 6.1.8.0 */
++	/* chip id 6.1.8.0 (A618) or 6.4.0.1 (A640), in the GMU's packing (a6xx_gmu_fw_start) */
++	ok = gmu_set("HFI_SFR_ADDR", REG_A6XX_GMU_HFI_SFR_ADDR,
++	    sweet_gpu_board.flame ? 0x06040100u : 0x06018000u) && ok;
+ 	ok = gmu_set("PWR_COL_CP_MSG", REG_A6XX_GMU_PWR_COL_CP_MSG, GMU_VA_LOG) && ok;
+ 	ok = gmu_set("SYS_BUS_CONFIG", REG_A6XX_GMU_SYS_BUS_CONFIG, 1) && ok;
+ 	ok = gmu_set("ICACHE_CONFIG", REG_A6XX_GMU_ICACHE_CONFIG, 1) && ok;
+--- a/bsd/dev/sweet_smmu.c
++++ b/bsd/dev/sweet_smmu.c
+@@ -29,7 +29,7 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ 
+-#define SMMU_PA                 0x05040000u
++#define SMMU_PA                 (sweet_gpu_board.smmu_pa)    /* SM7150 0x5040000; flame kgsl-smmu 0x2ca0000 */
+ #define SMMU_SIZE               0x10000u
+ /* Global register space 0 */
+ #define SMMU_sCR0               0x000u
