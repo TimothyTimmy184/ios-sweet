@@ -1,0 +1,43 @@
+--- a/bsd/dev/sweet_gpu_internal.h
++++ b/bsd/dev/sweet_gpu_internal.h
+@@ -90,6 +90,8 @@
+ 	vm_offset_t va;         /* uncached mapping of the table area */
+ 	uint64_t pa;
+ 	uint32_t size, used;    /* bytes; 4 KiB tables from the start, level 1 first */
++	bool priv;              /* pages privileged-only (AP[2:1] = 00), as Linux maps GMU memory
++	                         * (IOMMU_PRIV); else read/write at any privilege. sweet_smmu_pt_init: false */
+ };
+ bool sweet_smmu_survey(void);
+ void sweet_smmu_pt_init(struct sweet_smmu_pt *pt, vm_offset_t va, uint64_t pa, uint32_t size);
+--- a/bsd/dev/sweet_smmu.c
++++ b/bsd/dev/sweet_smmu.c
+@@ -196,6 +196,7 @@
+ 	pt->pa = pa;
+ 	pt->size = size;
+ 	pt->used = PT_SIZE;     /* the level-1 table */
++	pt->priv = false;
+ 	for (uint32_t i = 0; i < PT_SIZE; i += 8) {
+ 		*(volatile uint64_t *)(va + i) = 0;
+ 	}
+@@ -243,7 +244,8 @@
+ 			printf("SWEET SMMU: map %#x: already mapped\n", va);
+ 			return false;
+ 		}
+-		*(volatile uint64_t *)slot = (pa + off) | PTE_PAGE_RW;
++		/* A page writable at EL0 is never privileged-executable: priv pages can hold GMU code. */
++		*(volatile uint64_t *)slot = (pa + off) | (pt->priv ? (PTE_PAGE_RW & ~PTE_AP_UNPRIV) : PTE_PAGE_RW);
+ 	}
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	printf("SWEET SMMU: mapped %#010x..%#010x -> %#llx (%#x of %#x table bytes used)\n", iova, iova + len - 1u,
+--- a/bsd/dev/sweet_gmu.c
++++ b/bsd/dev/sweet_gmu.c
+@@ -433,6 +433,9 @@
+ 	printf("SWEET GMU:   mapped at %#lx, %u non-zero words in the used part\n", gm_mem, nonzero);
+ 	struct sweet_smmu_pt pt;
+ 	sweet_smmu_pt_init(&pt, gm_mem, gm_mem_pa, GMEM_PT_SIZE);
++	/* flame G3: the A640 GMU fetches code from the icache backing (0x4000..) as privileged; an
++	 * EL0-writable page faulted there (FSR PF, FSYNR0 IND). Mainline maps GMU memory IOMMU_PRIV. */
++	pt.priv = sweet_gpu_board.flame != 0;
+ 	for (unsigned i = 0; i < sizeof(gmu_regions) / sizeof(gmu_regions[0]); ++i) {
+ 		printf("SWEET GMU:   %s\n", gmu_regions[i].name);
+ 		if (!sweet_smmu_map(&pt, gmu_regions[i].iova, gm_mem_pa + gmu_regions[i].off, gmu_regions[i].len)) {
